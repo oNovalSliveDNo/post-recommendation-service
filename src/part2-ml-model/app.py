@@ -1,0 +1,128 @@
+import os
+from datetime import datetime
+from typing import List
+
+import pandas as pd
+from catboost import CatBoostClassifier
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from pydantic import BaseModel
+from sqlalchemy import create_engine
+
+load_dotenv()
+SQLALCHEMY_DATABASE_URL = os.getenv("SQLALCHEMY_DATABASE_URL")
+
+
+# Модель данных ответа API
+class PostGet(BaseModel):
+    id: int
+    text: str
+    topic: str
+
+    class Config:
+        from_attributes = True
+
+
+# Функция выбора пути к модели
+def get_model_path(path: str) -> str:
+    if os.environ.get("IS_LMS") == "1":
+        MODEL_PATH = "/workdir/user_input/model"
+    else:
+        MODEL_PATH = path
+    return MODEL_PATH
+
+
+# Функция загрузки модели
+def load_models():
+    model_path = get_model_path("catboost_model.cbm")
+    model = CatBoostClassifier()
+    model.load_model(model_path)
+    return model
+
+
+# Функция загрузки данных из БД с обработкой больших объёмов
+def batch_load_sql(query: str) -> pd.DataFrame:
+    CHUNKSIZE = 200000
+    engine = create_engine(SQLALCHEMY_DATABASE_URL)
+    conn = engine.connect().execution_options(stream_results=True)
+    chunks = []
+    for chunk_dataframe in pd.read_sql(query, conn, chunksize=CHUNKSIZE):
+        chunks.append(chunk_dataframe)
+    conn.close()
+    return pd.concat(chunks, ignore_index=True)
+
+
+# Функция загрузки всех необходимых данных
+def load_features():
+    tables = {
+        "user_data": "processed_user_data",
+        "feed_data": "processed_feed_data_like",
+        "post_features": "processed_post_text",
+        "clear_post_text": "clear_post_text"
+    }
+
+    user_data = batch_load_sql(f'SELECT * FROM "{tables["user_data"]}"')
+    feed_data = batch_load_sql(f'SELECT * FROM "{tables["feed_data"]}"')
+    post_features = batch_load_sql(f'SELECT * FROM "{tables["post_features"]}"')
+    clear_post_text = batch_load_sql(f'SELECT * FROM "{tables["clear_post_text"]}"')
+
+    return user_data, feed_data, post_features, clear_post_text
+
+
+# Инициализация FastAPI
+app = FastAPI()
+model = load_models()
+user_data, feed_data, post_features, clear_post_text = load_features()
+
+
+# Функция предобработки данных перед подачей в модель
+def preprocessing_data(user_id, month, day):
+    # Достаём данные пользователя
+    single_user_features = user_data.loc[user_data['user_id'] == user_id]
+
+    # Фильтруем посты, исключая уже просмотренные
+    filtered_post_text = post_features[post_features['post_id'].isin(feed_data['post_id'].unique())]
+    unique_post_ids = feed_data[feed_data['user_id'] == user_id]['post_id'].unique().tolist()
+    filtered_post_text_for_user = filtered_post_text[~filtered_post_text['post_id'].isin(unique_post_ids)]
+
+    # Добавляем информацию о пользователе
+    for col in user_data.columns:
+        filtered_post_text_for_user[col] = single_user_features[col].iloc[0]
+
+    # Добавляем нормализованные данные о времени
+    filtered_post_text_for_user['month'] = month / 12
+    filtered_post_text_for_user['day'] = day / 31
+
+    # Оставляем только нужные признаки
+    feature_columns = ['user_id', 'post_id', 'month', 'day', 'gender', 'os', 'source', 'city_countscaled',
+                       'country_countscaled', 'age_group_18_20', 'age_group_20_22', 'age_group_22_25',
+                       'age_group_25_30', 'age_group_30_35', 'age_group_35_40', 'age_group_gt_40', 'exp_group_1',
+                       'exp_group_2', 'exp_group_3', 'exp_group_4', 'tfidf_pc1', 'tfidf_pc2', 'tfidf_pc3',
+                       'tfidf_pc4', 'tfidf_pc5', 'tfidf_pc6', 'tfidf_pc7', 'tfidf_pc8', 'tfidf_pc9', 'tfidf_pc10',
+                       'tfidf_pc11', 'tfidf_pc12', 'tfidf_pc13', 'tfidf_pc14', 'tfidf_pc15', 'tfidf_pc16', 'tfidf_pc17',
+                       'tfidf_pc18', 'tfidf_pc19', 'tfidf_pc20', 'topic_covid', 'topic_entertainment', 'topic_movie',
+                       'topic_politics', 'topic_sport', 'topic_tech']
+
+    return filtered_post_text_for_user[feature_columns]
+
+
+# Основной эндпоинт рекомендаций
+@app.get("/post/recommendations/", response_model=List[PostGet])
+def recommended_posts(id: int, time: datetime, limit: int = 5) -> List[PostGet]:
+    # Подготавливаем данные
+    data = preprocessing_data(id, time.month, time.day)
+
+    # Делаем предсказание вероятности лайка
+    data['pred_proba'] = model.predict_proba(data)[:, 1]
+
+    # Отфильтруем нужные строки
+    post_ids = list(data.sort_values('pred_proba', ascending=False).head(limit)['post_id'])
+
+    # Используем генератор, чтобы не загружать весь DataFrame в память
+    def stream_post_data(df, post_ids):
+        for row in df.itertuples(index=False):
+            if row.post_id in post_ids:
+                yield {"id": row.post_id, "text": row.text, "topic": row.topic}
+
+    # Генерируем JSON-ответ построчно
+    return list(stream_post_data(clear_post_text, set(post_ids)))
