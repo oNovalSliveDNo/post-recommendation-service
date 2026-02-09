@@ -9,17 +9,23 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 
-load_dotenv()
-SQLALCHEMY_DATABASE_URL = os.getenv("SQLALCHEMY_DATABASE_URL")
+load_dotenv()  # Загружает переменные окружения
+SQLALCHEMY_DATABASE_URL = os.getenv("SQLALCHEMY_DATABASE_URL")  # Строка подключения к PostgreSQL
 
 
 # Модель данных ответа API
 class PostGet(BaseModel):
+    """
+    Описывает структуру одного рекомендованного поста.
+    """
     id: int
     text: str
     topic: str
 
     class Config:
+        """
+        Разрешает создавать модель из ORM-объектов, из namedtuple, из генераторов.
+        """
         from_attributes = True
 
 
@@ -35,32 +41,45 @@ def get_model_path(path: str) -> str:
 # Функция загрузки модели
 def load_models():
     model_path = get_model_path("catboost_model.cbm")
-    model = CatBoostClassifier()
-    model.load_model(model_path)
-    return model
+    model = CatBoostClassifier()  # Создаёт пустую модель
+    model.load_model(model_path)  # Загружает веса
+    return model  # Возвращает объект модели
 
 
 # Функция загрузки данных из БД с обработкой больших объёмов
 def batch_load_sql(query: str) -> pd.DataFrame:
-    CHUNKSIZE = 200000
+    """
+    Универсальная функция безопасной загрузки больших таблиц.
+    """
+    CHUNKSIZE = 200000  # Подобран под лимит RAM 4 Гб
     engine = create_engine(SQLALCHEMY_DATABASE_URL)
-    conn = engine.connect().execution_options(stream_results=True)
+    conn = engine.connect().execution_options(stream_results=True)  # данные не буферизуются целиком
+
     chunks = []
+    # Таблица читается порциями
     for chunk_dataframe in pd.read_sql(query, conn, chunksize=CHUNKSIZE):
+        # Каждая порция — маленький DataFrame
         chunks.append(chunk_dataframe)
+
     conn.close()
+
     return pd.concat(chunks, ignore_index=True)
 
 
 # Функция загрузки всех необходимых данных
 def load_features():
+    """
+    Единая точка загрузки всех данных, которые понадобятся сервису.
+    """
     tables = {
-        "user_data": "processed_user_data",
-        "feed_data": "processed_feed_data_like",
-        "post_features": "processed_post_text",
-        "clear_post_text": "clear_post_text"
+        "user_data": "processed_user_data",  # user-фичи
+        "feed_data": "processed_feed_data_like",  # история лайков
+        "post_features": "processed_post_text",  # post-фичи для ML
+        "clear_post_text": "clear_post_text"  # текст для ответа API
     }
 
+    # Делаем долгую инициализацию, потому что
+    # Запросы потом должны быть быстрыми
     user_data = batch_load_sql(f'SELECT * FROM "{tables["user_data"]}"')
     feed_data = batch_load_sql(f'SELECT * FROM "{tables["feed_data"]}"')
     post_features = batch_load_sql(f'SELECT * FROM "{tables["post_features"]}"')
@@ -71,27 +90,34 @@ def load_features():
 
 # Инициализация FastAPI
 app = FastAPI()
-model = load_models()
-user_data, feed_data, post_features, clear_post_text = load_features()
+model = load_models()  # загружается модель
+user_data, feed_data, post_features, clear_post_text = load_features()  # загружаются все фичи
 
+
+# --- Дальше сервис только читает память (in-memory ranking engine) ---
 
 # Функция предобработки данных перед подачей в модель
 def preprocessing_data(user_id, month, day):
-    # Достаём данные пользователя
+    # Достаём данные пользователя (один user_id → одна строка)
     single_user_features = user_data.loc[user_data['user_id'] == user_id]
 
-    # Фильтруем посты, исключая уже просмотренные
+    # --- Фильтруем посты, исключая уже лайкнутые пользователем ---
+
+    # Оставляем только посты, которые кто-то когда-то лайкнул
     filtered_post_text = post_features[post_features['post_id'].isin(feed_data['post_id'].unique())]
+    # Убираем лайкнутые пользователем посты
+    # Берём историю лайков пользователя и исключаем эти посты из кандидатов
     unique_post_ids = feed_data[feed_data['user_id'] == user_id]['post_id'].unique().tolist()
     filtered_post_text_for_user = filtered_post_text[~filtered_post_text['post_id'].isin(unique_post_ids)]
 
     # Добавляем информацию о пользователе
     for col in user_data.columns:
+        # Добавляем user-фичи (возраст, город, пол, ...) к каждому посту
         filtered_post_text_for_user[col] = single_user_features[col].iloc[0]
 
     # Добавляем нормализованные данные о времени
-    filtered_post_text_for_user['month'] = month / 12
-    filtered_post_text_for_user['day'] = day / 31
+    filtered_post_text_for_user['month'] = month / 12  # нормализация к [0; 1]
+    filtered_post_text_for_user['day'] = day / 31  # нормализация к [0; 1]
 
     # Оставляем только нужные признаки
     feature_columns = ['user_id', 'post_id', 'month', 'day', 'gender', 'os', 'source', 'city_countscaled',
@@ -103,6 +129,7 @@ def preprocessing_data(user_id, month, day):
                        'tfidf_pc18', 'tfidf_pc19', 'tfidf_pc20', 'topic_covid', 'topic_entertainment', 'topic_movie',
                        'topic_politics', 'topic_sport', 'topic_tech']
 
+    # Отбор ровно тех фичей, что были на обучении
     return filtered_post_text_for_user[feature_columns]
 
 
@@ -110,19 +137,29 @@ def preprocessing_data(user_id, month, day):
 @app.get("/post/recommendations/", response_model=List[PostGet])
 def recommended_posts(id: int, time: datetime, limit: int = 5) -> List[PostGet]:
     # Подготавливаем данные
+    # Из (user_id + time) получается DataFrame (candidate_posts × features)
     data = preprocessing_data(id, time.month, time.day)
 
     # Делаем предсказание вероятности лайка
+    # Модель не выбирает посты, а ранжирует кандидатов
     data['pred_proba'] = model.predict_proba(data)[:, 1]
 
     # Отфильтруем нужные строки
+    # Сортировка по вероятности лайка и выбор top-K
     post_ids = list(data.sort_values('pred_proba', ascending=False).head(limit)['post_id'])
 
     # Используем генератор, чтобы не загружать весь DataFrame в память
+    # Не делаем merge и не создаём новый DataFrame -> экономим память.
     def stream_post_data(df, post_ids):
         for row in df.itertuples(index=False):
             if row.post_id in post_ids:
                 yield {"id": row.post_id, "text": row.text, "topic": row.topic}
 
     # Генерируем JSON-ответ построчно
+    # Берём текст и topic, формируем JSON, возвращаем клиенту
     return list(stream_post_data(clear_post_text, set(post_ids)))
+
+# Архитектура сервиса:
+# 1. Предварительный отбор кандидатов (candidate filtering)
+# 2. ML-ранжирование кандидатов
+# 3. Быстрый in-memory inference без SQL внутри эндпоинта
