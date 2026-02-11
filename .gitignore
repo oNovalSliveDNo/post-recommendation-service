@@ -181,3 +181,5 @@ cython_debug/
 .cursorindexingignore
 
 catboost_info/
+raw_data/
+processed_data/
