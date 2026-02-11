@@ -40,7 +40,7 @@ def get_model_path(path: str) -> str:
 
 # Функция загрузки модели
 def load_models():
-    model_path = get_model_path("catboost_model.cbm")
+    model_path = get_model_path("catboost_ml_model.cbm")
     model = CatBoostClassifier()  # Создаёт пустую модель
     model.load_model(model_path)  # Загружает веса
     return model  # Возвращает объект модели
