@@ -74,7 +74,7 @@ def load_features():
     tables = {
         "user_data": "processed_user_data",  # user-фичи
         "feed_data": "processed_feed_data_like",  # история лайков
-        "post_features": "processed_post_text",  # post-фичи для ML
+        "post_features": "processed_post_text_dl",  # post-фичи для ML
         "clear_post_text": "clear_post_text"  # текст для ответа API
     }
 
