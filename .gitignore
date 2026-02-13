@@ -183,5 +183,5 @@ cython_debug/
 catboost_info/
 raw_data/
 processed_data/
-src/part4-ab-testing/views.csv
-src/part4-ab-testing/likes.csv
+part4-ab-testing/views.csv
+part4-ab-testing/likes.csv
